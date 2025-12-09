@@ -1,0 +1,482 @@
+import React, { useState, useEffect } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+
+/*
+  Enhanced Currency Converter — patched fixes
+  Fixes included in this update:
+  1) Robust Flag loading using SVGs (FlagCDN) to avoid broken-size PNG links.
+  2) More tolerant live-API parsing and improved error messages (shows HTTP status and body snippet when malformed).
+  3) Theme toggle applied to both documentElement and document.body for broader compatibility.
+  4) Minor UX: show Loader in menu when fetching and clearer status text.
+
+  Keep this file in a React + Tailwind project. Install framer-motion: npm i framer-motion
+*/
+
+// Fixed fallback exchange rates (base USD)
+const FIXED_RATES = {
+  USD: 1.0,
+  EUR: 0.92,
+  GBP: 0.79,
+  INR: 83.0,
+};
+const AVAILABLE = Object.keys(FIXED_RATES);
+
+// Flag helper: map currency code to FlagCDN country code
+const FLAG_MAP = { USD: "us", EUR: "eu", GBP: "gb", INR: "in" };
+
+const CurrencyFlag = ({ code, size = 32, alt = true }) => {
+  const cc = FLAG_MAP[code];
+  if (!cc) return null;
+  // Use SVGs from FlagCDN (better scaling & fewer broken-size issues)
+  const src = `https://flagcdn.com/${cc}.svg`;
+  return (
+    <img
+      src={src}
+      alt={alt ? `${code} flag` : ""}
+      width={size}
+      height={Math.round((size / 4) * 3)}
+      className="rounded-sm shadow-sm border object-cover"
+      onError={(e) => {
+        // hide broken images to avoid ugly placeholders
+        e.currentTarget.style.display = "none";
+      }}
+    />
+  );
+};
+
+export default function CurrencyConverter() {
+  // Core state
+  const [from, setFrom] = useState("EUR");
+  const [to, setTo] = useState("USD");
+  const [amount, setAmount] = useState(100);
+  const [result, setResult] = useState(null);
+
+  // UI state
+  const [minimized, setMinimized] = useState(false);
+  const [closed, setClosed] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [showAbout, setShowAbout] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
+
+  // Theme
+  const [theme, setTheme] = useState(() => {
+    try {
+      return localStorage.getItem("cc_theme") || "light";
+    } catch (e) {
+      return "light";
+    }
+  });
+
+  // Live rates
+  const [useLive, setUseLive] = useState(false);
+  const [rates, setRates] = useState(FIXED_RATES);
+  const [loadingRates, setLoadingRates] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [error, setError] = useState(null);
+
+  // History
+  const [history, setHistory] = useState(() => {
+    try {
+      const raw = localStorage.getItem("cc_history");
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) {
+      return [];
+    }
+  });
+
+  const CACHE_KEY = "cc_live_cache_v1";
+  const CACHE_TTL = 1000 * 60 * 60; // 1 hour
+
+  // apply theme (also add to body for broader compatibility)
+  useEffect(() => {
+    const root = document.documentElement;
+    const body = document.body;
+    if (theme === "dark") {
+      root.classList.add("dark");
+      body.classList.add("dark");
+    } else {
+      root.classList.remove("dark");
+      body.classList.remove("dark");
+    }
+    try {
+      localStorage.setItem("cc_theme", theme);
+    } catch (e) {}
+  }, [theme]);
+
+  // load cached rates
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(CACHE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Date.now() - parsed.ts < CACHE_TTL) {
+          setRates(parsed.rates);
+          setLastUpdated(parsed.ts);
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+  }, []);
+
+  // fetch live rates from exchangerate.host (robust parsing)
+  const fetchLiveRates = async (signal) => {
+    setError(null);
+    setLoadingRates(true);
+    try {
+      const symbols = AVAILABLE.join(",");
+      const url = `https://api.exchangerate.host/latest?base=USD&symbols=${symbols}`;
+      const resp = await fetch(url, { signal });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(`Network error: ${resp.status} ${resp.statusText} — ${text.slice(0,120)}`);
+      }
+      // parse JSON safely
+      let data;
+      try {
+        data = await resp.json();
+      } catch (parseErr) {
+        const txt = await resp.text().catch(() => "(no body)");
+        throw new Error(`Failed to parse JSON — response snippet: ${txt.slice(0,200)}`);
+      }
+
+      if (!data || typeof data !== 'object' || !data.rates || typeof data.rates !== 'object') {
+        const body = JSON.stringify(data).slice(0,300);
+        throw new Error(`Malformed API response — ${body}`);
+      }
+
+      // ensure every available currency has a rate, fallback otherwise
+      const newRates = {};
+      AVAILABLE.forEach((c) => {
+        newRates[c] = typeof data.rates[c] === "number" ? data.rates[c] : FIXED_RATES[c];
+      });
+      setRates(newRates);
+      setLastUpdated(Date.now());
+      try {
+        localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), rates: newRates }));
+      } catch (e) {
+        // ignore storage errors
+      }
+    } catch (err) {
+      const msg = err && err.message ? err.message : String(err);
+      setError(msg);
+      setRates(FIXED_RATES);
+    } finally {
+      setLoadingRates(false);
+    }
+  };
+
+  // watch useLive
+  useEffect(() => {
+    const ac = new AbortController();
+    if (useLive) fetchLiveRates(ac.signal);
+    else setRates(FIXED_RATES);
+    return () => ac.abort();
+  }, [useLive]);
+
+  // conversion logic
+  const convert = (amt = amount, f = from, t = to) => {
+    if (!amt || isNaN(amt)) return null;
+    const inUSD = Number(amt) / rates[f];
+    const out = inUSD * rates[t];
+    return Number(out.toFixed(4));
+  };
+
+  const handleConvert = (e) => {
+    e && e.preventDefault();
+    const out = convert();
+    setResult(out);
+    if (out !== null) {
+      const entry = { ts: Date.now(), from, to, amount: Number(amount), result: out, live: useLive };
+      const next = [entry, ...history].slice(0, 10);
+      setHistory(next);
+      try {
+        localStorage.setItem("cc_history", JSON.stringify(next));
+      } catch (e) {}
+    }
+  };
+
+  const swap = () => {
+    setFrom(to);
+    setTo(from);
+    if (result !== null) setResult(convert(amount, to, from));
+  };
+
+  const clearHistory = () => {
+    setHistory([]);
+    try {
+      localStorage.removeItem("cc_history");
+    } catch (e) {}
+  };
+
+  const copyResult = async () => {
+    if (result === null) return;
+    try {
+      await navigator.clipboard.writeText(`${result} ${to}`);
+      alert(`Copied: ${result} ${to}`);
+    } catch (e) {
+      alert("Copy failed");
+    }
+  };
+
+  // small animated loader
+  const Loader = () => (
+    <motion.div animate={{ rotate: 360 }} transition={{ loop: Infinity, duration: 0.8 }} className="w-5 h-5 border-2 border-t-transparent rounded-full" />
+  );
+
+  if (closed)
+    return (
+      <div className="max-w-md mx-auto mt-8 p-4">
+        <div className="border rounded-lg p-4 shadow-sm flex items-center justify-between bg-white dark:bg-gray-800">
+          <div>
+            <strong>Currency Converter</strong>
+            <div className="text-sm text-gray-500 dark:text-gray-400">Closed — click restore</div>
+          </div>
+          <button onClick={() => setClosed(false)} className="px-3 py-1 rounded bg-blue-600 text-white text-sm">Restore</button>
+        </div>
+      </div>
+    );
+
+  return (
+    <div className="min-h-screen p-6 bg-gray-50 dark:bg-gray-900 transition-colors">
+      <div className="max-w-2xl mx-auto">
+        <motion.div layout initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="rounded-2xl shadow-2xl overflow-hidden bg-white dark:bg-gray-800 border dark:border-gray-700">
+
+          {/* Header / window chrome */}
+          <div className="flex items-center justify-between px-4 py-2 bg-gray-100 dark:bg-gray-900 border-b dark:border-gray-700">
+            <div className="flex items-center gap-3">
+              <div className="w-8 h-8 flex items-center justify-center rounded-md bg-gradient-to-tr from-indigo-500 to-violet-500 text-white font-bold">CC</div>
+              <div>
+                <div className="text-sm font-semibold">Business Currency Converter</div>
+                <div className="text-xs text-gray-500 dark:text-gray-400">Fixed + Live rates</div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              {/* Hamburger menu */}
+              <div className="relative">
+                <button onClick={() => setMenuOpen((v) => !v)} aria-label="Open menu" className="p-2 rounded hover:bg-gray-200 dark:hover:bg-gray-700">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/></svg>
+                </button>
+
+                <AnimatePresence>
+                  {menuOpen && (
+                    <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }} className="absolute right-0 mt-2 w-64 bg-white dark:bg-gray-800 border dark:border-gray-700 rounded-lg shadow-lg z-20">
+                      <div className="p-3">
+                        <div className="flex items-center justify-between">
+                          <div className="font-semibold">Menu</div>
+                          <button onClick={() => setMenuOpen(false)} className="text-sm px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700">Close</button>
+                        </div>
+
+                        <div className="mt-3 space-y-2">
+                          <div className="flex items-center justify-between">
+                            <div className="text-sm">Use live rates</div>
+                            <label className="inline-flex items-center">
+                              <input type="checkbox" checked={useLive} onChange={(e) => setUseLive(e.target.checked)} className="form-checkbox" />
+                            </label>
+                          </div>
+
+                          <button onClick={() => setTheme((t) => (t === "light" ? "dark" : "light"))} className="w-full text-left px-3 py-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700">Toggle Theme ({theme})</button>
+
+                          <button onClick={() => { setShowHelp(true); setMenuOpen(false); }} className="w-full text-left px-3 py-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700">Help</button>
+
+                          <button onClick={() => { setShowAbout(true); setMenuOpen(false); }} className="w-full text-left px-3 py-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700">About</button>
+                        </div>
+
+                        <div className="mt-3 border-t pt-3 text-xs text-gray-500">v1.2 — live rates demo</div>
+                        <div className="mt-2 text-xs text-gray-400">Last update: {lastUpdated ? new Date(lastUpdated).toLocaleString() : "n/a"}</div>
+                        <div className="mt-1 text-xs text-gray-400">Status: {loadingRates ? "fetching..." : useLive ? "live" : "fixed"}</div>
+                        {loadingRates && <div className="mt-2"><Loader /></div>}
+                        {error && <div className="mt-2 text-xs text-red-500">Error: {error}</div>}
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+
+              {/* window controls */}
+              <div className="flex items-center gap-2">
+                <button onClick={() => setMinimized((v) => !v)} title="Minimize" className="w-8 h-8 flex items-center justify-center rounded hover:bg-gray-200 dark:hover:bg-gray-700">
+                  <svg width="14" height="14" viewBox="0 0 24 24"><path d="M5 12h14" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/></svg>
+                </button>
+                <button onClick={() => setClosed(true)} title="Close" className="w-8 h-8 flex items-center justify-center rounded hover:bg-red-600 hover:text-white">
+                  <svg width="14" height="14" viewBox="0 0 24 24"><path d="M6 6l12 12M6 18L18 6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Main content */}
+          <AnimatePresence>
+            {!minimized && (
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="p-6">
+                <form onSubmit={handleConvert} className="grid grid-cols-1 gap-4">
+
+                  <div className="flex flex-col sm:flex-row gap-4 items-center">
+                    <div className="flex items-center gap-3 w-full">
+                      <label className="min-w-[70px] text-sm">From</label>
+                      <div className="flex items-center gap-3 w-full">
+                        <CurrencyFlag code={from} size={36} />
+                        <select value={from} onChange={(e) => setFrom(e.target.value)} className="flex-1 px-3 py-2 border rounded-md bg-white dark:bg-gray-700">
+                          {AVAILABLE.map((c) => (<option key={c} value={c}>{c}</option>))}
+                        </select>
+                      </div>
+                    </div>
+
+                    <button type="button" onClick={swap} className="px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded">Swap</button>
+
+                    <div className="flex items-center gap-3 w-full">
+                      <label className="min-w-[50px] text-sm">To</label>
+                      <CurrencyFlag code={to} size={36} />
+                      <select value={to} onChange={(e) => setTo(e.target.value)} className="flex-1 px-3 py-2 border rounded-md bg-white dark:bg-gray-700">
+                        {AVAILABLE.map((c) => (<option key={c} value={c}>{c}</option>))}
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="flex gap-4 items-center">
+                    <input type="number" step="any" value={amount} onChange={(e) => setAmount(e.target.value)} className="flex-1 px-4 py-2 border rounded-md bg-white dark:bg-gray-700" />
+                    <button type="submit" className="px-4 py-2 rounded bg-indigo-600 text-white hover:scale-105 transform transition">Convert</button>
+                  </div>
+
+                  <div className="pt-2">
+                    <div className="text-sm text-gray-500 dark:text-gray-400">Rates in use (base USD):</div>
+                    <div className="mt-2 flex gap-3 text-xs overflow-auto">
+                      {AVAILABLE.map((c) => (
+                        <div key={c} className="flex items-center gap-2 bg-gray-50 dark:bg-gray-700 px-3 py-2 rounded">
+                          <CurrencyFlag code={c} size={20} />
+                          <div>
+                            <div className="font-medium">{c}</div>
+                            <div className="text-[11px] text-gray-500 dark:text-gray-300">{`1 USD = ${rates[c]} ${c}`}</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="flex items-center justify-between">
+                      <div className="text-sm text-gray-600 dark:text-gray-300">Result</div>
+                      <div className="text-xs text-gray-400">Source: {useLive ? "exchangerate.host (live)" : "built-in fixed"}</div>
+                    </div>
+
+                    <motion.div layout className="mt-2 p-3 bg-gray-50 dark:bg-gray-700 rounded">
+                      {result !== null ? (
+                        <div className="flex items-center gap-3">
+                          <CurrencyFlag code={to} size={28} />
+                          <div className="flex-1">
+                            <div className="text-lg font-semibold">{result} {to}</div>
+                            <div className="text-sm text-gray-500 dark:text-gray-300">Converted from {amount} {from}</div>
+                          </div>
+
+                          <div className="flex gap-2">
+                            <button onClick={copyResult} className="px-2 py-1 bg-gray-100 dark:bg-gray-600 rounded">Copy</button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="text-sm text-gray-500">No conversion yet. Enter amount and click Convert.</div>
+                      )}
+                    </motion.div>
+                  </div>
+
+                  {/* History */}
+                  <div>
+                    <div className="flex items-center justify-between">
+                      <div className="text-sm text-gray-600 dark:text-gray-300">History</div>
+                      <div className="text-xs text-gray-400">Showing last {history.length} conversions</div>
+                    </div>
+                    <div className="mt-2 grid gap-2">
+                      {history.length === 0 && <div className="text-sm text-gray-500">No history yet.</div>}
+                      {history.map((h) => (
+                        <motion.div key={h.ts} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} className="p-2 bg-gray-50 dark:bg-gray-700 rounded flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <CurrencyFlag code={h.from} size={20} />
+                            <div className="text-sm">{h.amount} {h.from} → {h.result} {h.to}</div>
+                          </div>
+                          <div className="text-xs text-gray-400">{new Date(h.ts).toLocaleString()}</div>
+                        </motion.div>
+                      ))}
+                    </div>
+                    {history.length > 0 && <div className="mt-2 text-right"><button onClick={clearHistory} className="text-xs text-red-500">Clear history</button></div>}
+                  </div>
+
+                </form>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </motion.div>
+
+        {/* About modal */}
+        <AnimatePresence>
+          {showAbout && (
+            <motion.div className="fixed inset-0 z-40 flex items-center justify-center p-4" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+              <div className="absolute inset-0 bg-black/40" onClick={() => setShowAbout(false)} />
+              <motion.div initial={{ y: 20 }} animate={{ y: 0 }} exit={{ y: 20 }} className="relative z-50 max-w-lg w-full bg-white dark:bg-gray-800 rounded-lg shadow-lg p-6">
+                <div className="flex items-start justify-between">
+                  <div>
+                    <h3 className="text-lg font-semibold">About</h3>
+                    <p className="text-sm text-gray-600 dark:text-gray-300 mt-2">This enhanced Business Currency Converter integrates live rates (optional), uses FlagCDN for flags, stores a short history locally, and provides a polished responsive UI with animations.
+                    </p>
+                  </div>
+                  <button onClick={() => setShowAbout(false)} className="text-sm px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700">Close</button>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Help modal */}
+        <AnimatePresence>
+          {showHelp && (
+            <motion.div className="fixed inset-0 z-40 flex items-center justify-center p-4" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+              <div className="absolute inset-0 bg-black/40" onClick={() => setShowHelp(false)} />
+              <motion.div initial={{ y: 20 }} animate={{ y: 0 }} exit={{ y: 20 }} className="relative z-50 max-w-lg w-full bg-white dark:bg-gray-800 rounded-lg shadow-lg p-6">
+                <div className="flex items-start justify-between">
+                  <div>
+                    <h3 className="text-lg font-semibold">Help</h3>
+                    <ul className="text-sm text-gray-600 dark:text-gray-300 mt-2 list-disc pl-5 space-y-2">
+                      <li>Toggle live rates from the menu. Live rates are fetched from exchangerate.host and cached for 1 hour.</li>
+                      <li>Use the dropdowns to select currencies; flags update automatically.</li>
+                      <li>Enter an amount and click Convert or press Enter to convert.</li>
+                      <li>Use Swap to flip 'From' and 'To'. Minimize hides the window; Close simulates closing the app.</li>
+                    </ul>
+                  </div>
+                  <button onClick={() => setShowHelp(false)} className="text-sm px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700">Close</button>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <div className="mt-6 text-xs text-gray-500">Tip: replace exchangerate.host URL if you prefer another provider or if you have an API key to use.</div>
+      </div>
+    </div>
+  );
+}
+
+/*
+  TESTS (Jest + React Testing Library)
+
+  Save as: CurrencyConverter.test.jsx
+
+  Example tests:
+
+  import React from 'react';
+  import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+  import CurrencyConverter from './CurrencyConverter';
+
+  test('renders convert button', () => {
+    render(<CurrencyConverter />);
+    expect(screen.getByText(/Convert/i)).toBeInTheDocument();
+  });
+
+  test('converts using fixed rates by default', async () => {
+    render(<CurrencyConverter />);
+    const amount = screen.getByRole('spinbutton');
+    fireEvent.change(amount, { target: { value: '10' } });
+    fireEvent.click(screen.getByText(/Convert/i));
+    await waitFor(() => expect(screen.getByText(/Converted from/i)).toBeInTheDocument());
+  });
+
+  // For live rates tests, mock fetch and localStorage as needed.
+*/
